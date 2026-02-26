@@ -15,6 +15,10 @@ class MercuryTransportError(Exception):
     pass
 
 
+class MercuryNoResponseError(MercuryTransportError):
+    pass
+
+
 class _TcpTransparentTransport:
     """
     Transparent TCP transport: bytes are passed as-is (RTU-over-TCP tunnel mode).
@@ -130,6 +134,22 @@ def _parse_serial_decimal(info_response_cmd: int, info_payload: bytes) -> str | 
     return serial_str
 
 
+def _normalize_address(address: int | str) -> int:
+    if isinstance(address, int):
+        value = address
+    elif isinstance(address, str):
+        text = address.strip()
+        if not text.isdigit():
+            raise ValueError("address must be decimal (for example: 47)")
+        value = int(text, 10)
+    else:
+        raise TypeError("address must be int or decimal string")
+
+    if not (0 <= value <= 255):
+        raise ValueError("address must be in range 0..255")
+    return value
+
+
 class Mercury230Client:
     """
     Minimal Mercury-230 polling client over RS-485 (protocol with CRC16/Modbus).
@@ -140,14 +160,18 @@ class Mercury230Client:
     def __init__(
         self,
         port: str | None,
-        address: int,
+        address: int | str,
         baudrate: int = 9600,
         timeout: float = 1.0,
+        retries: int = 1,
         transport: str = "serial",
         host: str | None = None,
         tcp_port: int | None = None,
     ) -> None:
-        self.address = address
+        self.address = _normalize_address(address)
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+        self.retries = retries
         if transport == "serial":
             if not port:
                 raise ValueError("port is required for serial transport")
@@ -170,24 +194,34 @@ class Mercury230Client:
     def from_serial(
         cls,
         port: str,
-        address: int,
+        address: int | str,
         baudrate: int = 9600,
         timeout: float = 1.0,
+        retries: int = 1,
     ) -> "Mercury230Client":
-        return cls(port=port, address=address, baudrate=baudrate, timeout=timeout, transport="serial")
+        return cls(
+            port=port,
+            address=address,
+            baudrate=baudrate,
+            timeout=timeout,
+            retries=retries,
+            transport="serial",
+        )
 
     @classmethod
     def from_tcp(
         cls,
         host: str,
         tcp_port: int,
-        address: int,
+        address: int | str,
         timeout: float = 1.0,
+        retries: int = 1,
     ) -> "Mercury230Client":
         return cls(
             port=None,
             address=address,
             timeout=timeout,
+            retries=retries,
             transport="tcp",
             host=host,
             tcp_port=tcp_port,
@@ -204,19 +238,40 @@ class Mercury230Client:
 
     def _exchange(self, command: int, data: bytes = b"", min_response: int = 4) -> tuple[int, bytes]:
         tx = build_frame(self.address, command, data)
-        self._io.reset_input_buffer()
-        self._io.write(tx)
+        last_rx = b""
+        last_error: Exception | None = None
 
-        # Protocol in your log uses variable response length; read at least frame header+crc,
-        # then grab whatever else is currently buffered.
-        rx = self._io.read(min_response)
-        rx += self._io.read(self._io.in_waiting)
+        for _ in range(self.retries + 1):
+            self._io.reset_input_buffer()
+            self._io.write(tx)
 
-        if len(rx) < 4:
-            raise MercuryTransportError(f"no or short response for command 0x{command:02X}: {rx.hex(' ')}")
+            # Protocol in your log uses variable response length; read at least frame header+crc,
+            # then grab whatever else is currently buffered.
+            rx = self._io.read(min_response)
+            rx += self._io.read(self._io.in_waiting)
+            last_rx = rx
 
-        _, response_cmd, payload = parse_frame(rx, expected_address=self.address)
-        return response_cmd, payload
+            if len(rx) < 4:
+                continue
+
+            try:
+                _, response_cmd, payload = parse_frame(rx, expected_address=self.address)
+                return response_cmd, payload
+            except MercuryProtocolError as exc:
+                last_error = exc
+                continue
+
+        if len(last_rx) < 4:
+            raise MercuryNoResponseError(
+                f"no response from meter address {self.address} for command 0x{command:02X} "
+                f"after {self.retries + 1} attempt(s)"
+            )
+
+        if last_error:
+            raise MercuryTransportError(
+                f"invalid response for command 0x{command:02X}: {last_rx.hex(' ')} ({last_error})"
+            )
+        raise MercuryTransportError(f"invalid response for command 0x{command:02X}: {last_rx.hex(' ')}")
 
     def test_link(self) -> bool:
         """Sends command 0x00 and validates frame/CRC in response."""
