@@ -113,6 +113,19 @@ class EnergyFromReset:
     raw: dict[str, bytes]
 
 
+@dataclass
+class InstantaneousValues:
+    active_power_w: dict[str, float | None]
+    reactive_power_var: dict[str, float | None]
+    apparent_power_va: dict[str, float | None]
+    power_factor: dict[str, float | None]
+    voltage_v: dict[str, float | None]
+    current_a: dict[str, float | None]
+    frequency_hz: float | None
+    phase_angle_deg: dict[str, float | None]
+    raw: dict[str, bytes]
+
+
 def _parse_build_date(data: bytes) -> date | None:
     if len(data) < 3:
         return None
@@ -390,6 +403,118 @@ class Mercury230Client:
         self.open_session(access_level=0x01, password=b"\x01\x01\x01\x01\x01\x01")
         self._exchange(0x08, b"\x12")
 
+    @staticmethod
+    def _scale(raw: int | None, divider: float, digits: int = 3) -> float | None:
+        if raw is None:
+            return None
+        return round(raw / divider, digits)
+
+    def _read_instantaneous_register(self, index: int) -> tuple[int | None, bytes]:
+        if not (0 <= index <= 0xFF):
+            raise ValueError("index must be 0..255")
+
+        response_cmd, payload = self._exchange(0x08, bytes([0x11, index]))
+        if response_cmd in (0x01, 0xFF):
+            # Unsupported/service short replies on some revisions.
+            return None, payload
+        if len(payload) < 2:
+            raise MercuryProtocolError(
+                f"unexpected instant payload for index {index:02X}: cmd={response_cmd:02X}, {payload.hex(' ')}"
+            )
+
+        # Mercury revisions may return instantaneous values with response command
+        # 0x00/0x40/0x80/0xC0 where upper bits encode sign flags.
+        if response_cmd not in (0x00, 0x40, 0x80, 0xC0):
+            raise MercuryProtocolError(
+                f"unexpected instant payload for index {index:02X}: cmd={response_cmd:02X}, {payload.hex(' ')}"
+            )
+
+        value = int.from_bytes(payload[0:2], "little", signed=False)
+        if value == 0xFFFF:
+            return None, payload
+
+        # Sign mapping inferred from observed exchanges:
+        # bit7 (0x80) affects active power registers, bit6 (0x40) affects reactive.
+        if index in (0x00, 0x01, 0x02, 0x03) and (response_cmd & 0x80):
+            value = -value
+        if index in (0x04, 0x05, 0x06, 0x07) and (response_cmd & 0x40):
+            value = -value
+        return value, payload
+
+    def read_instantaneous_values(self) -> InstantaneousValues:
+        """
+        Reads instantaneous values via command group 0x08/0x11.
+        Decoding/scales are based on validated exchange with Mercury-230.
+        """
+        self.open_session(access_level=0x01, password=b"\x01\x01\x01\x01\x01\x01")
+        # Sequence from real exchange: 0x03 then 0x12 before 0x11 registers.
+        self._exchange(0x08, b"\x03")
+        self._exchange(0x08, b"\x12")
+
+        raw: dict[str, bytes] = {}
+
+        def r(idx: int) -> int | None:
+            value, payload = self._read_instantaneous_register(idx)
+            raw[f"{idx:02X}"] = payload
+            return value
+
+        return InstantaneousValues(
+            active_power_w={
+                "sum": self._scale(r(0x00), 100, 2),
+                "phase1": self._scale(r(0x01), 100, 2),
+                "phase2": self._scale(r(0x02), 100, 2),
+                "phase3": self._scale(r(0x03), 100, 2),
+            },
+            reactive_power_var={
+                "sum": self._scale(r(0x04), 100, 2),
+                "phase1": self._scale(r(0x05), 100, 2),
+                "phase2": self._scale(r(0x06), 100, 2),
+                "phase3": self._scale(r(0x07), 100, 2),
+            },
+            apparent_power_va={
+                "sum": self._scale(r(0x08), 100, 2),
+                "phase1": self._scale(r(0x09), 100, 2),
+                "phase2": self._scale(r(0x0A), 100, 2),
+                "phase3": self._scale(r(0x0B), 100, 2),
+            },
+            power_factor={
+                "sum": self._scale(r(0x30), 1000, 3),
+                "phase1": self._scale(r(0x31), 1000, 3),
+                "phase2": self._scale(r(0x32), 1000, 3),
+                "phase3": self._scale(r(0x33), 1000, 3),
+            },
+            voltage_v={
+                "phase1": self._scale(r(0x11), 100, 2),
+                "phase2": self._scale(r(0x12), 100, 2),
+                "phase3": self._scale(r(0x13), 100, 2),
+            },
+            current_a={
+                "phase1": self._scale(r(0x21), 1000, 3),
+                "phase2": self._scale(r(0x22), 1000, 3),
+                "phase3": self._scale(r(0x23), 1000, 3),
+            },
+            frequency_hz=self._scale(r(0x40), 100, 2),
+            phase_angle_deg={
+                "12": self._scale(r(0x51), 100, 2),
+                "13": self._scale(r(0x52), 100, 2),
+                "23": self._scale(r(0x53), 100, 2),
+            },
+            raw=raw,
+        )
+
+    @staticmethod
+    def format_instantaneous_values(values: InstantaneousValues) -> dict[str, Any]:
+        return {
+            "active_power_w": values.active_power_w,
+            "reactive_power_var": values.reactive_power_var,
+            "apparent_power_va": values.apparent_power_va,
+            "power_factor": values.power_factor,
+            "voltage_v": values.voltage_v,
+            "current_a": values.current_a,
+            "frequency_hz": values.frequency_hz,
+            "phase_angle_deg": values.phase_angle_deg,
+        }
+
     def _read_energy_profile_group(self, group: int) -> EnergyFromReset:
         labels = {
             0: "sum",
@@ -467,3 +592,4 @@ class Mercury230Client:
             "current_transform_ratio": passport.current_transform_ratio,
             #"raw": {k: v.hex(" ") for k, v in passport.raw.items()},
         }
+

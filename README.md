@@ -14,6 +14,11 @@ Supported transports:
 - manufacture date
 - software version
 - transformation ratios
+- Instantaneous values reading (`read_instantaneous_values`):
+- active/reactive/apparent power (`sum`, `phase1`, `phase2`, `phase3`)
+- power factor (`sum`, `phase1`, `phase2`, `phase3`)
+- phase voltages and currents
+- frequency and phase angles
 - Energy from reset:
 - `sum`, `t1`, `t2`, `t3`, `t4`, `loss`
 - active energy (`kWh`)
@@ -67,6 +72,9 @@ try:
         energy_reset = meter.read_energy_from_reset()
         print(Mercury230Client.format_energy_from_reset(energy_reset))
 
+        instant = meter.read_instantaneous_values()
+        print(Mercury230Client.format_instantaneous_values(instant))
+
         all_months = meter.read_energy_all_months()
         for month in range(1, 13):
             print(month, Mercury230Client.format_energy_from_reset(all_months[month]))
@@ -91,4 +99,3 @@ except MercuryTransportError as exc:
 ## Disclaimer
 
 Provided as-is. Validate on your exact meter model and firmware before production use.
-
